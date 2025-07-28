@@ -27,6 +27,40 @@ class ModelInputForGPUWithPoolingMetadata(ModelInputForGPU):
     """
     pooling_metadata: Optional["PoolingMetadata"] = None
 
+def remap_hf_to_vllm_keys(state_dict):
+    print("[DEBUG] remap_hf_to_vllm_keys called")
+    new_state = {}
+    for k in list(state_dict.keys()):
+        v = state_dict[k]
+        # Merge QKV
+        if ".self_attn.q_proj." in k:
+            layer_prefix = k.split(".self_attn.q_proj.")[0]
+            key_suffix = k.split(".")[-1]
+            q = v
+            k_key = f"{layer_prefix}.self_attn.k_proj.{key_suffix}"
+            v_key = f"{layer_prefix}.self_attn.v_proj.{key_suffix}"
+            k_v = state_dict[k_key]
+            v_v = state_dict[v_key]
+            new_state[f"{layer_prefix}.self_attn.qkv_proj.{key_suffix}"] = torch.cat([q, k_v, v_v], dim=0)
+            continue
+        if any(x in k for x in [".self_attn.k_proj.", ".self_attn.v_proj."]):
+            continue
+        # Merge gate + up
+        if ".mlp.gate_proj." in k:
+            layer_prefix = k.split(".mlp.gate_proj.")[0]
+            key_suffix = k.split(".")[-1]
+            gate = v
+            up_key = f"{layer_prefix}.mlp.up_proj.{key_suffix}"
+            up = state_dict[up_key]
+            new_state[f"{layer_prefix}.mlp.gate_up_proj.{key_suffix}"] = torch.cat([gate, up], dim=0)
+            continue
+        if ".mlp.up_proj." in k:
+            continue
+        if k == "linear.weight":
+            new_state["model.linear.weight"] = v
+            continue
+        new_state[k] = v
+    return new_state
 
 class PoolingModelRunner(
         GPUModelRunnerBase[ModelInputForGPUWithPoolingMetadata]):
@@ -148,6 +182,21 @@ class PoolingModelRunner(
             self.model.pooler(hidden_states=hidden_or_intermediate_states,
                               pooling_metadata=model_input.pooling_metadata)
         ]
+
+    def unload_to_meta(self):
+        print("[DEBUG] PoolingModelRunner.unload_to_meta called")
+        """Forward unload to underlying model."""
+        if hasattr(self.model, "unload_to_meta"):
+            return self.model.unload_to_meta()
+        raise RuntimeError("Underlying model does not support unload_to_meta")
+
+    def reload_from_pinned(self, tensor_dict):
+        print("[DEBUG] PoolingModelRunner.reload_from_pinned called")
+        """Forward reload to underlying model."""
+        if hasattr(self.model, "load_state_dict"):
+            mapped_tensors = remap_hf_to_vllm_keys(tensor_dict)
+            return self.model.load_state_dict(mapped_tensors, strict=True, assign=True)
+        raise RuntimeError("Underlying model does not support reload_from_pinned")
 
     def make_model_input_from_broadcasted_tensor_dict(
             self,

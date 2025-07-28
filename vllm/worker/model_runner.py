@@ -1622,6 +1622,36 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
     def vocab_size(self) -> int:
         return self.model_config.get_vocab_size()
 
+def unload_model_to_meta(model):
+    print("[DEBUG] unload_model_to_meta called")
+    """
+    Moves model parameters and buffers to the 'meta' device, excluding rotary_emb cache buffers.
+    """
+    for name, param in list(model.named_parameters(recurse=True)):
+        if param.device.type == "meta":
+            continue
+        parts = name.split(".")
+        if "rotary_emb" in parts:
+            continue
+        mod = model
+        for p in parts[:-1]:
+            mod = getattr(mod, p)
+        leaf = parts[-1]
+        meta_param = torch.empty(param.shape, dtype=param.dtype, device="meta")
+        setattr(mod, leaf, torch.nn.Parameter(meta_param))
+
+    for name, buf in list(model.named_buffers(recurse=True)):
+        if buf.device.type == "meta":
+            continue
+        parts = name.split(".")
+        if "rotary_emb" in parts:
+            continue
+        mod = model
+        for p in parts[:-1]:
+            mod = getattr(mod, p)
+        leaf = parts[-1]
+        meta_buf = torch.empty(buf.shape, dtype=buf.dtype, device="meta")
+        setattr(mod, leaf, meta_buf)
 
 class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
     """
@@ -1641,6 +1671,16 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 attn_backend=self.attn_backend,
             )
         return model_input
+
+    def unload_to_meta(self):
+        print("[DEBUG] ModelRunner.unload_to_meta called")
+        """Move model params and buffers to 'meta' to free GPU memory."""
+        unload_model_to_meta(self.model)
+
+    def reload_from_pinned(self, tensor_dict):
+        print("[DEBUG] ModelRunner.reload_from_pinned called")
+        """Reload model weights from a shared/pinned memory tensor dictionary."""
+        self.model.load_state_dict(tensor_dict, strict=True, assign=True)
 
     def prepare_model_input(
         self,

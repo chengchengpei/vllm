@@ -72,6 +72,20 @@ def _create_pooling_model_cls(
                     softmax=default_softmax,
                 )
 
+        def unload_to_meta(self):
+            print("[DEBUG] PoolingModelAdapter.unload_to_meta called")
+            """Unload underlying model weights to meta."""
+            if hasattr(self.model, "unload_to_meta"):
+                return self.model.unload_to_meta()
+            raise RuntimeError("Underlying base model does not support unload_to_meta")
+
+        def reload_from_pinned(self, tensor_dict):
+            print("[DEBUG] PoolingModelAdapter.reload_from_pinned called")
+            """Reload underlying model from pinned memory."""
+            if hasattr(self.model, "load_state_dict"):
+                return self.model.load_state_dict(tensor_dict, strict=True, assign=True)
+            raise RuntimeError("Underlying base model does not support reload_from_pinned")
+
         def pooler(
             self,
             hidden_states: torch.Tensor,

@@ -112,6 +112,14 @@ class Worker(LocalOrDistributedWorkerBase):
         else:
             self.profiler = None
 
+    def unload_to_meta(self):
+        print("[DEBUG] Worker.unload_to_meta called")
+        return self.model_runner.unload_to_meta()
+
+    def reload_from_pinned(self, tensor_dict):
+        print("[DEBUG] Worker.reload_from_pinned called")
+        return self.model_runner.reload_from_pinned(tensor_dict)
+
     def start_profile(self):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")
