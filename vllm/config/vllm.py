@@ -1110,6 +1110,33 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("trace replay requires Model Runner V2")
 
+    def _verify_deferred_pp_sampled_token_recv(self) -> None:
+        delay = envs.VLLM_PP_DEFER_SAMPLED_TOKEN_RECV
+        if delay == 0:
+            return
+
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if not 0 < delay < pp_size:
+            raise ValueError(
+                "VLLM_PP_DEFER_SAMPLED_TOKEN_RECV must satisfy "
+                f"1 <= delay < pp_size; got delay={delay}, pp_size={pp_size}"
+            )
+        if not self.use_v2_model_runner:
+            raise ValueError(
+                "VLLM_PP_DEFER_SAMPLED_TOKEN_RECV requires Model Runner V2"
+            )
+        if not self.scheduler_config.async_scheduling:
+            raise ValueError(
+                "VLLM_PP_DEFER_SAMPLED_TOKEN_RECV requires async scheduling"
+            )
+
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda():
+            raise ValueError(
+                "VLLM_PP_DEFER_SAMPLED_TOKEN_RECV is currently supported only on CUDA"
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1671,6 +1698,8 @@ class VllmConfig:
                 "Prefill context parallelism requires Model Runner V2. "
                 "Remove VLLM_USE_V2_MODEL_RUNNER=0."
             )
+
+        self._verify_deferred_pp_sampled_token_recv()
 
         self._validate_batch_sharded_sampling()
 
