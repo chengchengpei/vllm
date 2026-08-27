@@ -12,6 +12,7 @@ import pytest
 from vllm.v1.worker.gpu.pp_utils import (
     PendingRecv,
     PPHandler,
+    classify_readiness_opportunity,
     compute_need_sampled_mask,
 )
 
@@ -134,6 +135,40 @@ def test_consume_fallback_is_counted() -> None:
 
     assert handler.num_consume_fallbacks == 1
     assert launches == [(0, 4)]
+
+
+@pytest.mark.parametrize(
+    (
+        "active",
+        "scheduled",
+        "unmapped_reqs",
+        "unmapped_tokens",
+        "expected",
+    ),
+    [
+        ({1, 2}, {1: 1, 2: 1}, 0, 0, (2, 0, 2, 0)),
+        ({1, 2}, {1: 1, 3: 512}, 1, 128, (1, 2, 1, 640)),
+        ({1, 2}, {3: 512}, 0, 0, (0, 1, 0, 512)),
+        ({1, 2}, {}, 0, 0, (0, 0, 0, 0)),
+    ],
+)
+def test_classify_readiness_opportunity(
+    active: set[int],
+    scheduled: dict[int, int],
+    unmapped_reqs: int,
+    unmapped_tokens: int,
+    expected: tuple[int, int, int, int],
+) -> None:
+    result = classify_readiness_opportunity(
+        active, scheduled, unmapped_reqs, unmapped_tokens
+    )
+
+    assert (
+        result.required_reqs,
+        result.independent_reqs,
+        result.required_tokens,
+        result.independent_tokens,
+    ) == expected
 
 
 @pytest.mark.parametrize(

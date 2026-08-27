@@ -982,11 +982,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
-    def update_pp_decode_requests(self):
+    def update_pp_decode_requests(self, scheduler_output: SchedulerOutput):
         # For non-last PP ranks, update decode requests with sampler output from
         # the prior step in which they were scheduled (pp_size steps ago).
         if self.pp_handler is not None:
-            outputs = self.pp_handler.get_prev_sampled_outputs()
+            scheduled_req_tokens: dict[int, int] | None = None
+            unmapped_scheduled_reqs = 0
+            unmapped_scheduled_tokens = 0
+            if self.pp_handler.collect_recv_wait_stats:
+                scheduled_req_tokens = {}
+                for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+                    req_idx = self.req_states.req_id_to_index.get(req_id)
+                    if req_idx is None:
+                        # New requests are installed after PP feedback is
+                        # consumed and cannot depend on an older feedback slot.
+                        unmapped_scheduled_reqs += 1
+                        unmapped_scheduled_tokens += num_tokens
+                    else:
+                        scheduled_req_tokens[req_idx] = num_tokens
+            outputs = self.pp_handler.get_prev_sampled_outputs(
+                scheduled_req_tokens,
+                unmapped_scheduled_reqs,
+                unmapped_scheduled_tokens,
+            )
             if outputs is not None:
                 self.postprocess_sampled(**outputs)
 
@@ -1502,7 +1520,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
-            self.update_pp_decode_requests()
+            self.update_pp_decode_requests(scheduler_output)
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)

@@ -37,6 +37,47 @@ class PendingRecv:
     gen_at_receive_np: np.ndarray  # [num_reqs]
 
 
+@dataclass(frozen=True)
+class ReadinessOpportunity:
+    """Work in the selected batch relative to one due feedback slot."""
+
+    required_reqs: int
+    independent_reqs: int
+    required_tokens: int
+    independent_tokens: int
+
+
+def classify_readiness_opportunity(
+    active_req_indices: set[int],
+    scheduled_req_tokens: dict[int, int],
+    unmapped_scheduled_reqs: int = 0,
+    unmapped_scheduled_tokens: int = 0,
+) -> ReadinessOpportunity:
+    """Classify selected work that does or does not need a due PP result.
+
+    New requests are not in the worker's request-index map yet, so callers pass
+    them through the ``unmapped`` counters. They are necessarily independent
+    of a sampled-result slot created by an older batch.
+    """
+    required_reqs = 0
+    independent_reqs = unmapped_scheduled_reqs
+    required_tokens = 0
+    independent_tokens = unmapped_scheduled_tokens
+    for req_idx, num_tokens in scheduled_req_tokens.items():
+        if req_idx in active_req_indices:
+            required_reqs += 1
+            required_tokens += num_tokens
+        else:
+            independent_reqs += 1
+            independent_tokens += num_tokens
+    return ReadinessOpportunity(
+        required_reqs=required_reqs,
+        independent_reqs=independent_reqs,
+        required_tokens=required_tokens,
+        independent_tokens=independent_tokens,
+    )
+
+
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     """Return a bool array of shape `[input_batch.num_reqs]` marking requests
     with outputs that might be needed in a subsequent (decode) step.
@@ -108,6 +149,16 @@ class PPHandler:
         self.num_measured_consume_waits = 0
         self.total_consume_wait_ms = 0.0
         self.max_consume_wait_ms = 0.0
+        self.num_unready_all_dependent_batches = 0
+        self.num_unready_mixed_batches = 0
+        self.num_unready_independent_batches = 0
+        self.num_unready_empty_batches = 0
+        self.total_unready_required_reqs = 0
+        self.total_unready_independent_reqs = 0
+        self.total_unready_required_tokens = 0
+        self.total_unready_independent_tokens = 0
+        self.max_unready_independent_reqs = 0
+        self.max_unready_independent_tokens = 0
         self.pending_wait_events: deque[tuple[torch.cuda.Event, torch.cuda.Event]] = (
             deque()
         )
@@ -231,16 +282,20 @@ class PPHandler:
             self.total_consume_wait_ms += elapsed_ms
             self.max_consume_wait_ms = max(self.max_consume_wait_ms, elapsed_ms)
 
-    def _wait_for_receive(self, event: torch.cuda.Event) -> None:
+    def _wait_for_receive(
+        self, event: torch.cuda.Event, ready_at_consume: bool | None = None
+    ) -> None:
         """Wait on the main stream and measure a genuinely unready receive."""
         if self.collect_recv_wait_stats:
             # Keep diagnostic runs bounded instead of retaining two CUDA events
             # for every historical hard wait until shutdown.
             self._collect_completed_wait_timings()
+            if ready_at_consume is None:
+                ready_at_consume = event.query()
         if (
             self.recv_launch_delay
             and self.collect_recv_wait_stats
-            and not event.query()
+            and ready_at_consume is False
         ):
             self.num_unready_at_consume += 1
             start_event = torch.cuda.Event(enable_timing=True)
@@ -263,7 +318,14 @@ class PPHandler:
             "idle_boundaries=%d, idle_flushes=%d, idle_flushed_receives=%d, "
             "consume_fallbacks=%d, unready_at_consume=%d, "
             "measured_consume_waits=%d, total_consume_wait_ms=%.3f, "
-            "max_consume_wait_ms=%.3f, wait_timing_enabled=%s",
+            "max_consume_wait_ms=%.3f, unready_all_dependent_batches=%d, "
+            "unready_mixed_batches=%d, unready_independent_batches=%d, "
+            "unready_empty_batches=%d, total_unready_required_reqs=%d, "
+            "total_unready_independent_reqs=%d, "
+            "total_unready_required_tokens=%d, "
+            "total_unready_independent_tokens=%d, "
+            "max_unready_independent_reqs=%d, "
+            "max_unready_independent_tokens=%d, wait_timing_enabled=%s",
             self.num_deferred_recv_launches,
             self.num_idle_boundaries,
             self.num_idle_flushes,
@@ -273,10 +335,25 @@ class PPHandler:
             self.num_measured_consume_waits,
             self.total_consume_wait_ms,
             self.max_consume_wait_ms,
+            self.num_unready_all_dependent_batches,
+            self.num_unready_mixed_batches,
+            self.num_unready_independent_batches,
+            self.num_unready_empty_batches,
+            self.total_unready_required_reqs,
+            self.total_unready_independent_reqs,
+            self.total_unready_required_tokens,
+            self.total_unready_independent_tokens,
+            self.max_unready_independent_reqs,
+            self.max_unready_independent_tokens,
             self.collect_recv_wait_stats,
         )
 
-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
+    def get_prev_sampled_outputs(
+        self,
+        scheduled_req_tokens: dict[int, int] | None = None,
+        unmapped_scheduled_reqs: int = 0,
+        unmapped_scheduled_tokens: int = 0,
+    ) -> dict[str, torch.Tensor] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
         """
@@ -302,7 +379,60 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
-        self._wait_for_receive(slot.event)
+        ready_at_consume = None
+        if self.recv_launch_delay and self.collect_recv_wait_stats:
+            ready_at_consume = slot.event.query()
+            if not ready_at_consume:
+                active_req_indices = set(map(int, slot.idx_mapping_np[~exclude_mask]))
+                opportunity = classify_readiness_opportunity(
+                    active_req_indices,
+                    scheduled_req_tokens or {},
+                    unmapped_scheduled_reqs,
+                    unmapped_scheduled_tokens,
+                )
+                self.total_unready_required_reqs += opportunity.required_reqs
+                self.total_unready_independent_reqs += opportunity.independent_reqs
+                self.total_unready_required_tokens += opportunity.required_tokens
+                self.total_unready_independent_tokens += opportunity.independent_tokens
+                self.max_unready_independent_reqs = max(
+                    self.max_unready_independent_reqs,
+                    opportunity.independent_reqs,
+                )
+                self.max_unready_independent_tokens = max(
+                    self.max_unready_independent_tokens,
+                    opportunity.independent_tokens,
+                )
+                if opportunity.required_reqs:
+                    if opportunity.independent_reqs:
+                        self.num_unready_mixed_batches += 1
+                        kind = "mixed"
+                    else:
+                        self.num_unready_all_dependent_batches += 1
+                        kind = "all_dependent"
+                elif opportunity.independent_reqs:
+                    self.num_unready_independent_batches += 1
+                    kind = "independent"
+                else:
+                    self.num_unready_empty_batches += 1
+                    kind = "empty"
+
+                count = self.num_unready_at_consume + 1
+                if count <= 8 or count & (count - 1) == 0:
+                    logger.info(
+                        "PP readiness opportunity: kind=%s active_slot_reqs=%d "
+                        "required_reqs=%d independent_reqs=%d "
+                        "required_tokens=%d independent_tokens=%d "
+                        "unready_event=%d",
+                        kind,
+                        len(active_req_indices),
+                        opportunity.required_reqs,
+                        opportunity.independent_reqs,
+                        opportunity.required_tokens,
+                        opportunity.independent_tokens,
+                        count,
+                    )
+
+        self._wait_for_receive(slot.event, ready_at_consume)
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
