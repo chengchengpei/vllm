@@ -35,6 +35,9 @@ class PendingRecv:
     # Snapshot of slot generation counters at receive time, used to
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
+    # Local PP scheduler-step sequence used to correlate this feedback slot
+    # with per-stage NVTX timelines. It is diagnostic only.
+    origin_step: int
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,7 @@ class PPHandler:
         self.total_unready_independent_tokens = 0
         self.max_unready_independent_reqs = 0
         self.max_unready_independent_tokens = 0
+        self.current_step = -1
         self.pending_wait_events: deque[tuple[torch.cuda.Event, torch.cuda.Event]] = (
             deque()
         )
@@ -359,6 +363,7 @@ class PPHandler:
         """
         if not self.queue:
             return None
+        self.current_step += 1
         slot = self._advance_receive_queue()
         if slot is None:
             return None
@@ -419,10 +424,13 @@ class PPHandler:
                 count = self.num_unready_at_consume + 1
                 if count <= 8 or count & (count - 1) == 0:
                     logger.info(
-                        "PP readiness opportunity: kind=%s active_slot_reqs=%d "
+                        "PP readiness opportunity: origin_step=%d due_step=%d "
+                        "kind=%s active_slot_reqs=%d "
                         "required_reqs=%d independent_reqs=%d "
                         "required_tokens=%d independent_tokens=%d "
                         "unready_event=%d",
+                        slot.origin_step,
+                        self.current_step,
                         kind,
                         len(active_req_indices),
                         opportunity.required_reqs,
@@ -490,6 +498,7 @@ class PPHandler:
             input_batch.idx_mapping_np,
             need_sampled_mask,
             gen_at_receive_np,
+            self.current_step,
         )
         self._queue_receive(slot)
         return bool(need_sampled_mask.all())
